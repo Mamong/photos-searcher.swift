@@ -1,32 +1,15 @@
 //
-//  ContentView.swift
+//  LibrarySearchView.swift
 //  Photos-Searcher
 //
-//  Created by shonenada on 2023/4/26.
+//  Created by tryao on 2023/7/8.
 //
 
 import SwiftUI
 import Foundation
+import Photos
 import CoreML
 import GRDB
-
-class LogTracer {
-    var date: Date;
-
-    init() {
-        date = Date()
-    }
-
-    func start() {
-        date = Date()
-    }
-
-    func logWithTime(msg: String) {
-        let now = Date()
-        print("\(now.timeIntervalSince(date)) \(msg)")
-        date = now
-    }
-}
 
 struct ContentView: View {
     let logTracer = LogTracer();
@@ -34,7 +17,6 @@ struct ContentView: View {
     @State var textEncoder: ClipTextEncoder? = nil;
     @State var imageEncoder: ClipImageEncoder? = nil;
     @State var photoFeatures: [String: [Float32]] = [:];
-    @State var photos: [String: UIImage] = [:];
 
     @State var isInitModel: Bool = false;
     @State var isModelReady: Bool = false;
@@ -53,7 +35,7 @@ struct ContentView: View {
                     isInitModel = true
                     DispatchQueue.global(qos: .userInitiated).async {
                         initModels()
-                        scanPhotos()
+                        checkPhotoLibraryAuth()
                     }
                 }, label: {
                     Text("Scan Photos")
@@ -63,11 +45,19 @@ struct ContentView: View {
             } else if !isModelReady {
                 Text("Scaning photos...")
             } else {
-                HStack {
-                    Text("Keyword")
-                    TextField("Keyword", text: $keyword)
+                if #available(iOS 15.0, *) {
+                    HStack {
+                        Text("Keyword")
+                        TextField("Keyword", text: $keyword)
+                    }
+                    .padding(20).textInputAutocapitalization(TextInputAutocapitalization.never)
+                } else {
+                    HStack {
+                        Text("Keyword")
+                        TextField("Keyword", text: $keyword)
+                    }
+                    .padding(20).autocapitalization(UITextAutocapitalizationType.none)
                 }
-                        .padding(20)
                 Button(action: {
                     isSearching = true
                     DispatchQueue.global(qos: .userInitiated).async {
@@ -85,17 +75,44 @@ struct ContentView: View {
 
                 ScrollView {
                     ForEach(Array(displayImages.enumerated()), id: \.offset) { idx, image in
-                        Image(uiImage: image)
+                        if !isSearching{
+                            Image(uiImage: image)
                                 .resizable()
                                 .imageScale(.large)
                                 .aspectRatio(contentMode: .fit)
-                        Text("Probs: \(displayFeatures[idx])")
+                            Text("Probs: \(displayFeatures[idx])")
+                        }
                     }
                 }
 
             }
         }
-                .padding()
+        .padding().onTapGesture {
+            if #available(iOS 15.0, *){
+                let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene
+                scene?.keyWindow?.endEditing(true)
+            }else{
+                UIApplication.shared.windows.first?.endEditing(true)
+            }
+        }
+    }
+
+    func checkPhotoLibraryAuth(){
+        PHPhotoLibrary.requestAuthorization { (status) in
+               switch status {
+               case .authorized:
+                   print("Good to proceed")
+                   scanPhotos()
+               case .denied, .restricted:
+                   print("Not allowed")
+               case .notDetermined:
+                   print("Not determined yet")
+               case .limited:
+                   print("limited")
+               @unknown default:
+                   print("unknown")
+               }
+           }
     }
 
     func initModels() {
@@ -150,16 +167,16 @@ struct ContentView: View {
     func scanPhotos() {
         let startTS = NSDate().timeIntervalSince1970
 
-        let group = DispatchGroup()
-        let queue = DispatchQueue.global(qos: .background)
-
         if (isModelReady) {
             return
         }
+
         print("Scan photos")
         // Getting features from example photos
-        var features: [String: [Float32]] = [:];
-        let jsonDecoder = JSONDecoder()
+        var localIds: Set<String> = []
+
+        //PHPhotoLibrary.shared().register(self)
+
         do {
             try dbQueue.read { db in
                 let allFeatures = try! Feature.fetchAll(db)
@@ -167,11 +184,14 @@ struct ContentView: View {
 
                 for i in 0..<allFeatures.count {
                     let f = allFeatures[i]
-                    let image = f.image
-                    let featureString = f.feature
-                    let jsonData = featureString!.data(using: .utf8)!
-                    let feature = try! jsonDecoder.decode([Float32].self, from: jsonData)
-                    features[image] = feature
+                    let featureData = f.feature
+                    let localId = f.localId
+
+                    let feature = try! featureData.withUnsafeBytes(){ (buffer: UnsafeRawBufferPointer) throws -> [Float32] in
+                        return Array<Float32>(buffer.bindMemory(to: Float32.self))
+                    }
+                    localIds.insert(localId)
+                    self.photoFeatures[localId] = feature;
                 }
             }
         } catch {
@@ -179,59 +199,51 @@ struct ContentView: View {
         }
         print("Parse vector from database: \(NSDate().timeIntervalSince1970 - startTS)")
 
-        for j in 0..<1000 {
-            for i in 0...9 {
-                group.enter()
-                queue.async {
-                    let number = j * 10 + i
-                    let name = "image_\(number)"
-                    var found = false
-                    if let feature = features[name] {
-                        print("Load photo \(number) from database")
-                        let imageName = "photo\(i).jpg"
-                        let image = UIImage(named: imageName)
-                        self.photos[name] = image!;
-                        self.photoFeatures[name] = feature;
-                        found = true
-                    }
-                    // TODO: Refactor: split codes.
-                    if !found {
-                        print("Scanning photo \(number)")
-                        let imageName = "photo\(i).jpg"
+        var photos = [PHAsset]()
+        let fetchOptions = PHFetchOptions()
+        //fetchOptions.includeAssetSourceTypes = [.typeUserLibrary]
+        //fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        //fetchOptions.predicate = NSPredicate(format: "mediaType = %d", PHAssetMediaType.image.rawValue)
+        let allPhotos = PHAsset.fetchAssets(with: .image, options: fetchOptions)
 
-                        let image = UIImage(named: imageName)
-                        self.photos[name] = image!;
+        let imageManager = PHImageManager()
+        let options = PHImageRequestOptions()
+        options.deliveryMode = .opportunistic
+        options.isSynchronous = true
+        options.resizeMode = .exact
+        options.isNetworkAccessAllowed = false
 
-                        let resized = image?.resize(size: CGSize(width: 244, height: 244))
-                        // TODO: Use Vision package to resize and center crop image.
-                        let ciImage = CIImage(image: resized!)
-                        let cgImage = convertCIImageToCGImage(inputImage: ciImage!)
-                        let jsonEncoder = JSONEncoder()
-                        do {
-                            let input = try ClipImageEncoderInput(imageWith: cgImage!)
-                            let output = try self.imageEncoder?.prediction(input: input)
-                            let outputFeatures = output!.features
-                            let featuresArray = convertMultiArray(input: outputFeatures)
-                            let jsonData = try? jsonEncoder.encode(featuresArray)
-                            let jsonString = String(data: jsonData!, encoding: .utf8)!
-                            self.photoFeatures[name] = featuresArray;
+        //查找没有缓存特征的图片
+        allPhotos.enumerateObjects { asset, idx, _ in
+            if self.photoFeatures[asset.localIdentifier] == nil {
+                photos.append(asset)
+            }else{
+                localIds.remove(asset.localIdentifier)
+            }
+        }
 
-                            try dbQueue.write { db in
-                                var x = Feature(image: "image_\(number)", feature: jsonString)
-                                try! x.insert(db)
-                            }
-                            //                        try dbQueue.read { db in
-                            //                            if let row = try Row.fetchOne(db, sql: "SELECT vss_version();") {
-                            //                                print(row)
-                            //                            }
-                            //                        }
-                        } catch {
-                            print("Failed to encode image photo \(number)")
-                            print(error)
-                        }
-                    }
-                    group.leave()
+        //清除已删除图的特征
+        if localIds.isEmpty == false {
+            localIds.forEach { id in
+                self.photoFeatures.removeValue(forKey: id)
+                _ = try? dbQueue.write({ db in
+                    try Feature.deleteOne(db, key: ["localId":id])
+                })
+            }
+        }
+
+        //缓存新增图的特征
+        let group = DispatchGroup()
+        for (idx, photo) in photos.enumerated() {
+            group.enter()
+            imageManager.requestImage(for: photo, targetSize: CGSizeMake(244, 244), contentMode: PHImageContentMode.aspectFill, options: options) { image, info in
+                if let image{
+                    extractFeatures(asset: photo, image: image)
+                    print("extractFeatures:\(idx)")
+                }else{
+                    print("fail extractFeatures:\(idx)")
                 }
+                group.leave()
             }
         }
         group.notify(queue: .main) {
@@ -274,35 +286,76 @@ struct ContentView: View {
         let textArr = convertMultiArray(input: features!)
         var sims: [String: Float32] = [:];
 //        var sims: [Float32] = [];
-        for (name, imageFeature) in photoFeatures {
+        for (localId, imageFeature) in photoFeatures {
             let out = cosineSimilarity(textArr, imageFeature)
-            sims[name] = out
-//            sims.append(out)
+            sims[localId] = out
         }
-//        let probs = softmax(sims)
-//        var simsMap: [(Int, Float32)] = []
-//        for i in 0..<probs.count {
-//            let prob = probs[i]
-//            simsMap.append((i, prob))
-//        }
-//        simsMap.sort {
-//            $0.1 > $1.1
-//        }
         let sortedSims = sims.sorted {
             $0.value > $1.value
         }
 
         displayImages.removeAll()
         displayFeatures.removeAll()
-        for p in sortedSims.prefix(3) {
-            if let photo = photos[p.key] {
-                displayImages.append(photo);
-                displayFeatures.append(p.value);
+
+        let imageManager = PHCachingImageManager()
+        let options = PHImageRequestOptions()
+        //options.deliveryMode = .highQualityFormat
+        options.isSynchronous = true
+        options.resizeMode = .fast
+        options.isNetworkAccessAllowed = false
+
+        let group = DispatchGroup()
+        for p in sortedSims.prefix(20) {
+            group.enter()
+            let result = PHAsset.fetchAssets(withLocalIdentifiers: [p.key], options: nil)
+            imageManager.requestImage(for: result.firstObject!, targetSize: CGSize.init(width: 1024, height: 1024), contentMode: PHImageContentMode.default, options: options) { image, info in
+                if let image{
+                    displayImages.append(image)
+                    displayFeatures.append(p.value)
+                }else{
+                    //原图在iCloud中
+                    //let icloud = (info?[PHImageResultIsInCloudKey] as? NSNumber)?.boolValue ?? false
+                    print("\(p.key) failed to fetch image:\(info!)")
+                }
+                group.leave()
             }
         }
-        isSearching = false;
-        print("Search \(NSDate().timeIntervalSince1970 - startTS)")
+        group.notify(queue: .main) {
+            isSearching = false;
+            print("Search \(NSDate().timeIntervalSince1970 - startTS)")
+        }
     }
+
+    func photoLibraryDidChange(_ changeInstance: PHChange){
+
+    }
+
+    func extractFeatures(asset: PHAsset, image:UIImage){
+        // TODO: Use Vision package to resize and center crop image.
+        let ciImage = CIImage(image: image)
+        let cgImage = convertCIImageToCGImage(inputImage: ciImage!)
+        do {
+            let input = try ClipImageEncoderInput(imageWith: cgImage!)
+            let output = try self.imageEncoder?.prediction(input: input)
+            let outputFeatures = output!.features
+            let featuresArray = convertMultiArray(input: outputFeatures)
+            let data = featuresArray.withUnsafeBufferPointer { (pointer:UnsafeBufferPointer<Float32>) in
+                return Data(buffer: pointer)
+            }
+
+            self.photoFeatures[asset.localIdentifier] = featuresArray
+
+            try dbQueue.write { db in
+                var x = Feature( feature: data,
+                                 localId: asset.localIdentifier)
+                try! x.insert(db)
+            }
+        } catch {
+            print("Failed to encode image photo")
+            print(error)
+        }
+    }
+
 }
 
 struct ContentView_Previews: PreviewProvider {
@@ -310,3 +363,4 @@ struct ContentView_Previews: PreviewProvider {
         ContentView()
     }
 }
+

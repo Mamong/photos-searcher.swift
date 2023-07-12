@@ -2,7 +2,7 @@
 // Copyright (C) 2022 Apple Inc. All Rights Reserved.
 import Foundation
 
-@available(iOS 16.2, macOS 13.1, *)
+@available(iOS 14.0, macOS 11.0, *)
 extension BPETokenizer {
     enum FileReadError: Error {
         case invalidMergeFileLine(Int)

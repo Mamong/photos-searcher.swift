@@ -33,8 +33,9 @@ final class DatabaseManager {
         migrator.registerMigration("createFeature") { db in
             try db.create(table: "feature") { t in
                 t.autoIncrementedPrimaryKey("id")
-                t.column("image", .text).notNull()
-                t.column("feature", .text).notNull()
+                t.column("image", .text)
+                t.column("feature", .blob).notNull()
+                t.column("localId", .blob).notNull().unique()
             }
         }
 
